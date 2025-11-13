@@ -1,0 +1,190 @@
+# Docker Compose Configuration for ML Pipeline
+#
+# This file orchestrates all services needed for the ML pipeline:
+# - PostgreSQL: Database for MLflow and Prefect
+# - MLflow: Experiment tracking and model registry
+# - Prefect Server: Workflow orchestration
+# - Model API: FastAPI model serving
+# - Prometheus: Metrics collection
+# - Grafana: Metrics visualization
+#
+# Usage:
+#   Start all services: docker-compose up -d
+#   View logs: docker-compose logs -f
+#   Stop all services: docker-compose down
+
+version: '3.8'
+
+services:
+  # ============================================================================
+  # Database
+  # ============================================================================
+  postgres:
+    image: postgres:14-alpine
+    container_name: ml-pipeline-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mlpipeline}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme123}
+      POSTGRES_DB: ${POSTGRES_DB:-mlpipeline}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - ml-pipeline
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlpipeline"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================================
+  # MLflow Server
+  # ============================================================================
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.2
+    container_name: ml-pipeline-mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_USER:-mlpipeline}:${POSTGRES_PASSWORD:-changeme123}@postgres:5432/mlflow
+      MLFLOW_ARTIFACT_ROOT: /mlartifacts
+    volumes:
+      - mlflow_artifacts:/mlartifacts
+    ports:
+      - "5000:5000"
+    networks:
+      - ml-pipeline
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://${POSTGRES_USER:-mlpipeline}:${POSTGRES_PASSWORD:-changeme123}@postgres:5432/mlflow
+      --default-artifact-root /mlartifacts
+      --host 0.0.0.0
+      --port 5000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================================
+  # Prefect Server
+  # ============================================================================
+  prefect-server:
+    image: prefecthq/prefect:2.14-python3.9
+    container_name: ml-pipeline-prefect
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://${POSTGRES_USER:-mlpipeline}:${POSTGRES_PASSWORD:-changeme123}@postgres:5432/prefect
+      PREFECT_SERVER_API_HOST: 0.0.0.0
+      PREFECT_API_URL: http://prefect-server:4200/api
+    ports:
+      - "4200:4200"
+    networks:
+      - ml-pipeline
+    command: prefect server start --host 0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4200/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================================
+  # Model Serving API
+  # ============================================================================
+  model-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: ml-pipeline-api
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      MODEL_REGISTRY_URI: http://mlflow:5000
+      MODEL_SERVICE_HOST: 0.0.0.0
+      MODEL_SERVICE_PORT: 8000
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    ports:
+      - "8000:8000"
+    networks:
+      - ml-pipeline
+    volumes:
+      - ./models:/app/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================================
+  # Prometheus (Metrics Collection)
+  # ============================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ml-pipeline-prometheus
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - ml-pipeline
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================================
+  # Grafana (Metrics Visualization)
+  # ============================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ml-pipeline-grafana
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3000:3000"
+    networks:
+      - ml-pipeline
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# ============================================================================
+# Networks
+# ============================================================================
+networks:
+  ml-pipeline:
+    driver: bridge
+
+# ============================================================================
+# Volumes
+# ============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  mlflow_artifacts:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
